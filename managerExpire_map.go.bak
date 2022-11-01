@@ -1,0 +1,283 @@
+package expiredmap
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// 定义 expiremap 类型
+type expiremap struct {
+	data       map[string]interface{}
+	mu         sync.RWMutex
+	ttl        time.Duration
+	expiration map[string]time.Time
+}
+
+// 创建新的 expiremap 实例
+func NewExpireMap(ttl time.Duration) *expiremap {
+	em := &expiremap{
+		data:       make(map[string]interface{}),
+		ttl:        ttl,
+		expiration: make(map[string]time.Time),
+	}
+	go em.cleanupExpired()
+	return em
+}
+
+// 设置值到 expiremap 中
+func (em *expiremap) Set(key string, value interface{}) {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	em.data[key] = value
+	em.expiration[key] = time.Now().Add(em.ttl)
+}
+
+// 获取值从 expiremap 中
+func (em *expiremap) Get(key string) (interface{}, bool) {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	value, exists := em.data[key]
+	if !exists || time.Now().After(em.expiration[key]) {
+		return nil, false
+	}
+	return value, true
+}
+
+// 清理过期的条目
+func (em *expiremap) cleanupExpired() {
+	for {
+		time.Sleep(time.Minute)
+		em.mu.Lock()
+		now := time.Now()
+		for key, exp := range em.expiration {
+			if now.After(exp) {
+				delete(em.data, key)
+				delete(em.expiration, key)
+			}
+		}
+		em.mu.Unlock()
+	}
+}
+
+// 定义 Node 类型为 *expiremap
+type Node struct {
+	expireMap *expiremap
+}
+
+// 定义全局节点管理器为 expiremap
+var nodeManager = NewExpireMap(10 * time.Minute) // 10分钟过期时间用于 nodeManager
+
+// 创建新节点
+func createNode(key string, ttl time.Duration) Node {
+	em := NewExpireMap(ttl)
+	node := Node{expireMap: em}
+	nodeManager.Set(key, node.expireMap)
+	return node
+}
+
+// 插入子节点
+func insertChild(parentKey, childKey string, ttl time.Duration) {
+	nodeManager.mu.RLock()
+	defer nodeManager.mu.RUnlock()
+
+	parentNodeData, parentExists := nodeManager.Get(parentKey)
+	if !parentExists {
+		fmt.Printf("Parent node %s does not exist.\n", parentKey)
+		return
+	}
+
+	parentNode, ok := parentNodeData.(*expiremap)
+	if !ok {
+		fmt.Printf("Parent node %s is not a valid expiremap.\n", parentKey)
+		return
+	}
+
+	// 创建或获取子节点
+	childNodeData, childExists := nodeManager.Get(childKey)
+	if !childExists {
+		childNodeData = NewExpireMap(ttl)
+		nodeManager.Set(childKey, childNodeData)
+	}
+
+	// 将子节点插入父节点
+	parentNode.Set(childKey, childNodeData)
+}
+
+// 打印树结构
+func printTree(node *expiremap, depth int) {
+	node.mu.RLock()
+	defer node.mu.RUnlock()
+
+	for key, value := range node.data {
+		fmt.Printf("%s%s\n", string(' '+depth*2), key)
+		if childNode, ok := value.(*expiremap); ok {
+			printTree(childNode, depth+1)
+		}
+	}
+}
+
+func main() {
+	// 示例用法
+	rootNode := createNode("root", 5*time.Minute)
+	insertChild("root", "child1", 5*time.Minute)
+	insertChild("root", "child2", 5*time.Minute)
+	insertChild("child1", "grandchild1", 5*time.Minute)
+
+	fmt.Println("Tree structure:")
+	rootNodeData, _ := nodeManager.Get("root")
+	if rootNodeData != nil {
+		rootNode := rootNodeData.(*expiremap)
+		printTree(rootNode, 0)
+	}
+}
+
+///////////////////////////
+//////////////////////////
+
+// 定义 NodeManager 类型
+type NodeManager struct {
+	m              *ExpiredMap[string, *ExpiredMap[string, any]]
+	rootMapTracker map[string]*ExpiredMap[string, any]
+	childRefCounts map[string]int64
+	sync.RWMutex
+}
+
+// 创建新的 NodeManager 实例
+func NewNodeManager(expireInterval time.Duration) *NodeManager {
+	return &NodeManager{
+		m:              NewChildMap[string, *ExpiredMap[string, any]](expireInterval), //过期的key 托管给各个rootMapTracker中的root进行加调删除
+		rootMapTracker: make(map[string]*ExpiredMap[string, any]),
+		childRefCounts: make(map[string]int64),
+	}
+	//不需要回调，回调不用回调自身
+}
+func (nm *NodeManager) handleChildExpire(childKey string) {
+	nm.Lock()
+	defer nm.Unlock()
+
+	// 减少引用计数
+	if refCount, exists := nm.childRefCounts[childKey]; exists {
+		refCount--
+		if refCount <= 0 {
+			// 如果引用计数为0，删除该子节点及其所有引用
+			nm.m.Delete(childKey)
+			delete(nm.childRefCounts, childKey)
+		} else {
+			nm.childRefCounts[childKey] = refCount
+		}
+	}
+}
+
+func (nm *NodeManager) cleanupExpiredNodes() {
+	nm.Lock()
+	defer nm.Unlock()
+	nm.m.HandleForeach(func(key string, rootMap *ExpiredMap[string, any]) {
+		if rootMap.Size() == 0 {
+			return
+		}
+		rootMap.HandleForeach(func(childKey string, childValue any) {
+			if childMap, ok := childValue.(*ExpiredMap[string, any]); ok {
+				if childMap.Size() == 0 {
+					nm.childRefCounts[childKey]--
+					if nm.childRefCounts[childKey] <= 0 {
+						nm.m.Delete(childKey)
+						delete(nm.childRefCounts, childKey)
+					}
+				}
+			}
+		})
+	})
+
+	// 清理未被任何根节点引用的过期子节点
+	for key, refCount := range nm.childRefCounts {
+		if refCount <= 0 {
+			nm.m.Delete(key)
+			delete(nm.childRefCounts, key)
+		}
+	}
+}
+
+func (nm *NodeManager) insertNode(rootKey string, ttl time.Duration) *ExpiredMap[string, any] {
+	nm.Lock()
+	defer nm.Unlock()
+
+	if _, exists := nm.m.Get(rootKey); exists {
+		fmt.Printf("Root node %s already exists.\n", rootKey)
+		return
+	}
+
+	em := NewRootMap[string, any](ttl)
+	nm.m.Set(rootKey, em, ttl)
+	nm.rootMapTracker[rootKey] = em
+
+	// 设置清理回调，当根节点的子节点被清理时调用
+	rootMap.SetOnExpire(func(key string, value any) {
+		nm.handleChildExpire(key)
+	})
+}
+
+func (nm *NodeManager) insertChild(parentKey, childKey string, ttl time.Duration) {
+	nm.Lock()
+	defer nm.Unlock()
+
+	// 从 nm.m 中查找父节点
+	parentNode, parentExists := nm.m.Get(parentKey)
+	if !parentExists {
+		fmt.Printf("Parent node %s does not exist.\n", parentKey)
+		return
+	}
+
+	// 查找或创建子节点
+	childNode, childExists := nm.m.Get(childKey)
+	if !childExists {
+		childNode = NewChildMap[string, any](ttl)
+		nm.m.Set(childKey, childNode, ttl)
+		nm.childRefCounts[childKey] = 0 // 初始化引用计数器
+
+		childNode.SetOnExpire(func(key string, value any) {
+			nm.handleChildExpire(key) //见expiremap cleanup 注释
+		})
+	}
+
+	// 将子节点插入到父节点中
+	if parentMap, ok := parentNode.(*ExpiredMap[string, any]); ok {
+		parentMap.Set(childKey, childNode, ttl)
+	} else {
+		fmt.Printf("Parent node %s is not of expected type.\n", parentKey)
+		return
+	}
+
+	// 增加子节点引用计数
+	nm.childRefCounts[childKey]++
+}
+
+func (nm *NodeManager) Close() {
+	nm.m.Close()
+}
+
+/* func main() {
+	nodeManager := NewNodeManager(10 * time.Minute)
+
+	// 示例用法
+	rootNode := nodeManager.createNode("root", 5*time.Minute)
+	nodeManager.insertChild("root", "child1", 5*time.Minute)
+	nodeManager.insertChild("root", "child2", 5*time.Minute)
+	nodeManager.insertChild("child1", "grandchild1", 5*time.Minute)
+
+	// 清理过期的节点
+	nodeManager.cleanupExpiredNodes()
+
+	// 打印树结构
+	rootNodeData, _ := nodeManager.m.Get("root")
+	if rootNodeData != nil {
+		rootNode := rootNodeData.(*ExpiredMap[string, any])
+		fmt.Println("Root Node:")
+		rootNode.HandleForeach(func(key string, value any) {
+			fmt.Printf("  %s\n", key)
+		})
+	}
+
+	// 关闭 nodeManager
+	nodeManager.Close()
+} */
